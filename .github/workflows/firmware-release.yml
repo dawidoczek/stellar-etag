@@ -47,7 +47,7 @@ jobs:
           initial_version: '0.0.0'
 
       - name: Build firmware
-        run: make -C Firmware all
+        run: sh build_docker.sh
 
       - name: Prepare release asset name
         id: prep
