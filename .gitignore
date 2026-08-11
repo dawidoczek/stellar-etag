@@ -1,0 +1,9 @@
+Firmware/out/*
+Firmware/tc32_linux
+Firmware/tc32_windows
+Firmware/ATC_Paper.bin
+flashing
+flash.bat
+Firmware_test_gpio
+.vscode
+.DS_STORE

@@ -1,0 +1,1158 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>Electronic Shelf Label Bluetooth Controller</title>
+    <style>
+      /* Minimal custom tweaks; Tailwind + DaisyUI handle the rest */
+      #tool-box > * {
+        margin-right: 5px;
+      }
+      .eink {
+        color: #000;
+        background: #fff;
+      }
+    </style>
+    <!-- UI libs: DaisyUI + Tailwind (browser) -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/daisyui@5"
+      rel="stylesheet"
+      type="text/css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/rgbquant/src/rgbquant.min.js"></script>
+    <script>
+      function hexToBytes(hex) {
+        const clean = hex.replace(/\s|0x|,/gi, "");
+        if (clean.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(clean)) throw new Error("Invalid hex string");
+        const bytes = new Uint8Array(clean.length / 2);
+        for (let c = 0; c < clean.length; c += 2) bytes[c / 2] = parseInt(clean.slice(c, c + 2), 16);
+        return bytes;
+      }
+      function bytesToHex(data) {
+        return new Uint8Array(data).reduce((memo, i) => memo + ("0" + i.toString(16)).slice(-2), "");
+      }
+      function intToHex(intIn, bytes = 4) {
+        return intIn.toString(16).padStart(bytes * 2, "0");
+      }
+      function canvas2bytes(canvas, type = "bw") {
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return new Uint8Array(0);
+        const { width, height } = canvas;
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const data = imageData.data;
+        const totalBits = width * height;
+        const arr = new Uint8Array(Math.ceil(totalBits / 8));
+        let byteIndex = 0, byte = 0, bitCount = 0;
+        for (let x = width - 1; x >= 0; x--) {
+          for (let y = 0; y < height; y++) {
+            const index = (width * y + x) * 4;
+            let bit;
+            if (type !== "bwr") bit = (data[index] > 0 && data[index + 1] > 0 && data[index + 2] > 0) ? 1 : 0;
+            else bit = (data[index] > 0 && data[index + 1] === 0 && data[index + 2] === 0) ? 1 : 0;
+            byte = (byte << 1) | bit;
+            bitCount++;
+            if (bitCount === 8) {
+              arr[byteIndex++] = byte;
+              byte = 0;
+              bitCount = 0;
+            }
+          }
+        }
+        if (bitCount > 0) arr[byteIndex] = byte << (8 - bitCount);
+        return arr;
+      }
+
+      const bwrPalette = [[0, 0, 0], [255, 255, 255], [255, 0, 0]];
+      const bwPalette = [[0, 0, 0], [255, 255, 255]];
+
+      async function bufferIntoImageData(data) {
+        if (typeof ImageData !== 'undefined' && data instanceof ImageData) return data;
+        if (typeof HTMLCanvasElement !== 'undefined' && data instanceof HTMLCanvasElement) {
+          const ctx = data.getContext('2d', { willReadFrequently: true });
+          if (!ctx) throw new Error('Canvas 2D context not available');
+          return ctx.getImageData(0, 0, data.width, data.height);
+        }
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) throw new Error('Canvas context is not available.');
+        return new Promise((resolve, reject) => {
+          const blob = data instanceof Blob ? data : new Blob([data], { type: 'image/png' });
+          const url = URL.createObjectURL(blob);
+          const image = new Image();
+          image.onload = () => {
+            try {
+              canvas.width = image.width;
+              canvas.height = image.height;
+              context.drawImage(image, 0, 0);
+              resolve(context.getImageData(0, 0, image.width, image.height));
+            } finally {
+              URL.revokeObjectURL(url);
+            }
+          };
+          image.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error('Failed to decode image.'));
+          };
+          image.src = url;
+        });
+      }
+
+      async function ditheringCanvasByPalette(canvas, palette, kern, opts = {}) {
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return;
+        const w = canvas.width;
+        const h = canvas.height;
+        const { dithSerp } = opts;
+        const quantOptions = { palette, dithKern: kern || 'Atkinson', dithSerp, minHueCols: 256, method: 1, initColors: 16000 };
+        const quant = new RgbQuant(quantOptions);
+        quant.sample(canvas);
+        quant.palette();
+        const output = quant.reduce(canvas);
+        if ((output instanceof Uint8Array || output instanceof Uint8ClampedArray) && output.length === w * h * 4) {
+          ctx.putImageData(new ImageData(new Uint8ClampedArray(output), w, h), 0, 0);
+          return;
+        }
+        try {
+          const imageDataConv = await bufferIntoImageData(output);
+          ctx.putImageData(imageDataConv, 0, 0);
+        } catch (e) {
+          console.error('Quant output could not be decoded:', e);
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <script>
+      let bleDevice;
+      let gattServer;
+      let epdService;
+      let rxtxService;
+      let epdCharacteristic;
+      let rxtxCharacteristic;
+      let reconnectTrys = 0;
+      // Pristine copy of the last loaded image (canvas-sized) for re-dithering
+      let gOriginalImageData = null;
+
+      function delay(delayInms) {
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            resolve(2);
+          }, delayInms);
+        });
+      }
+
+      function resetVariables() {
+        gattServer = null;
+        epdService = null;
+        epdCharacteristic = null;
+        rxtxCharacteristic = null;
+        rxtxService = null;
+        document.getElementById("log").value = "";
+      }
+
+      async function handleError(error) {
+        console.log(error);
+        resetVariables();
+        if (bleDevice == null) return;
+        if (reconnectTrys <= 5) {
+          reconnectTrys++;
+          await connect();
+        } else {
+          addLog("Was not able to connect, aborting");
+          reconnectTrys = 0;
+        }
+      }
+
+      async function sendCommand(cmd) {
+        if (epdCharacteristic) {
+          await epdCharacteristic.writeValueWithResponse(cmd);
+        } else {
+          addLog("Service unavailable. Is Bluetooth connected?");
+        }
+      }
+
+      async function clearScreen(cmd) {
+        addLog("Clear screen");
+        await triggerEpdCmd(`00${cmd}`);
+        await triggerEpdCmd("01");
+      }
+
+      async function rxTxSendCommand(cmd) {
+        if (rxtxCharacteristic) {
+          await rxtxCharacteristic.writeValueWithResponse(cmd);
+        } else {
+          addLog("Service unavailable. Is Bluetooth connected?");
+        }
+      }
+
+      async function upload_tiff_image() {
+        const startTime = new Date().getTime();
+        const buffer = await document
+          .getElementById("tiff_file")
+          .files[0].arrayBuffer();
+        const arr = bytesToHex(buffer);
+
+        addLog(`Start uploading TIFF, size ${arr.length / 1024} KB`);
+
+        await sendCommand(hexToBytes("0000"));
+
+        await sendCommand(hexToBytes("020000"));
+
+        const step = 480;
+        let partIndex = 0;
+        for (let i = 0; i < arr.length; i += step) {
+          addLog(
+            `Uploading block ${partIndex + 1}. Block size: ${step + 1} bytes`
+          );
+          await sendCommand(hexToBytes("03" + arr.slice(i, i + step)));
+          partIndex += 1;
+        }
+
+        await sendCommand(hexToBytes("04"));
+        addLog(
+          `TIFF upload completed, took ${
+            (new Date().getTime() - startTime) / 1000
+          }s`
+        );
+      }
+
+      async function sendBufferData(value, type) {
+        addLog(
+          `Start sending image mode: ${type}, size ${
+            value.length / 2 / 1024
+          } KB`
+        );
+        let code = "ff";
+        if (type === "bwr") {
+          code = "00";
+        }
+        const step = 480;
+        let partIndex = 0;
+        for (let i = 0; i < value.length; i += step) {
+          addLog(
+            `Sending block ${partIndex + 1}. Block size: ${
+              step / 2 + 4
+            } bytes. Offset: ${i / 2}`
+          );
+          await sendCommand(
+            hexToBytes(
+              "03" + code + intToHex(i / 2, 2) + value.substring(i, i + step)
+            )
+          );
+          partIndex += 1;
+        }
+      }
+
+      async function upload_image() {
+        const canvas = document.getElementById("canvas");
+
+        const startTime = new Date().getTime();
+
+        await sendCommand(hexToBytes("0000"));
+
+        await sendCommand(hexToBytes("020000"));
+
+        await sendBufferData(bytesToHex(canvas2bytes(canvas)), "bw");
+        await sendBufferData(bytesToHex(canvas2bytes(canvas, "bwr")), "bwr");
+
+        await sendCommand(hexToBytes("0101"));
+
+        addLog(
+          `Refresh done, took ${(new Date().getTime() - startTime) / 1000}s`
+        );
+      }
+
+      async function upload_epd_buffer() {
+        const startTime = new Date().getTime();
+        const value = document
+          .getElementById("buffer")
+          .value.replace(/(?:\r\n|\r|\n|,|0x| )/g, "");
+
+        addLog(`Start updating display buffer, size ${value.length / 1024} KB`);
+
+        await sendCommand(hexToBytes("0000"));
+
+        await sendCommand(hexToBytes("020000"));
+
+        await sendBufferData(value, "bw");
+
+        await delay(150);
+
+        await sendCommand(hexToBytes("0101"));
+
+        addLog(
+          `Refresh done, took ${(new Date().getTime() - startTime) / 1000}s`
+        );
+      }
+
+      async function setTime() {
+        const { unixNow, localeTimeString, year, month, day, week } =
+          getUnixTime();
+
+        addLog(
+          "Time set to: " + localeTimeString + " : dd" + intToHex(unixNow, 4)
+        );
+        await rxTxSendCommand(
+          hexToBytes(
+            "dd" +
+              [
+                intToHex(unixNow, 4),
+                intToHex(year, 2),
+                intToHex(month, 1),
+                intToHex(day, 1),
+                intToHex(week, 1),
+              ].join("")
+          )
+        );
+
+        await rxTxSendCommand(hexToBytes("e2"));
+      }
+
+      async function triggerRxTxCmd(cmd) {
+        addLog(`Send command: ${cmd}`);
+        await rxTxSendCommand(hexToBytes(cmd));
+      }
+
+      async function triggerEpdCmd(cmd) {
+        addLog(`Send command: ${cmd}`);
+        await sendCommand(hexToBytes(cmd));
+      }
+
+      function disconnect() {
+        resetVariables();
+        addLog("Disconnected.");
+        document.getElementById("connectbutton").innerHTML = "Connect";
+      }
+
+      async function preConnect() {
+        if (gattServer != null && gattServer.connected) {
+          if (bleDevice != null && bleDevice.gatt.connected)
+            bleDevice.gatt.disconnect();
+        } else {
+          reconnectTrys = 0;
+          bleDevice = await navigator.bluetooth.requestDevice({
+            optionalServices: [
+              "0000221f-0000-1000-8000-00805f9b34fb",
+              "00001f10-0000-1000-8000-00805f9b34fb",
+              "13187b10-eba9-a3ba-044e-83d3217d9a38",
+            ],
+            acceptAllDevices: true,
+          });
+          await bleDevice.addEventListener(
+            "gattserverdisconnected",
+            disconnect
+          );
+          try {
+            await connect();
+          } catch (e) {
+            await handleError(e);
+          }
+        }
+      }
+
+      async function connectRXTX() {
+        rxtxService = await gattServer.getPrimaryService(
+          "00001f10-0000-1000-8000-00805f9b34fb"
+        );
+        addLog("> Found UART service");
+
+        rxtxCharacteristic = await rxtxService.getCharacteristic(
+          "00001f1f-0000-1000-8000-00805f9b34fb"
+        );
+        addLog("> UART service connected");
+        
+        await rxtxCharacteristic.startNotifications();
+        rxtxCharacteristic.addEventListener(
+          "characteristicvaluechanged",
+          (event) => {
+            const buf = new Uint8Array(event.target.value.buffer);
+            if (buf[0] === 0xE2 && buf[1] === 0xAC) {
+                const unix = buf[2] | (buf[3] << 8) | (buf[4] << 16) | (buf[5] << 24);
+                const now = new Date();
+                const realUnix = Math.floor((now.getTime() - now.getTimezoneOffset() * 60_000) / 1000);
+                const diff = unix - realUnix;
+                addLog(`[Time Test] Tag UNIX: ${unix}, Browser UNIX: ${realUnix}. Diff: ${diff} seconds.`);
+            } else {
+                addLog(`> [From RxTx]: ${bytesToHex(event.target.value.buffer)}`);
+            }
+          }
+        );
+      }
+
+      async function reConnect() {
+        connectTrys = 0;
+        if (bleDevice != null && bleDevice.gatt.connected)
+          bleDevice.gatt.disconnect();
+        resetVariables();
+        addLog("Reconnecting");
+        setTimeout(async function () {
+          await connect();
+        }, 300);
+      }
+
+      async function connect() {
+        if (epdCharacteristic == null) {
+          addLog("Connecting to: " + bleDevice.name);
+
+          gattServer = await bleDevice.gatt.connect();
+          addLog("> Found GATT server");
+
+          epdService = await gattServer.getPrimaryService(
+            "13187b10-eba9-a3ba-044e-83d3217d9a38"
+          );
+          addLog("> Found service");
+
+          epdCharacteristic = await epdService.getCharacteristic(
+            "4b646063-6264-f3a7-8941-e65356ea82fe"
+          );
+          addLog("> Service connected");
+
+          await epdCharacteristic.startNotifications();
+
+          epdCharacteristic.addEventListener(
+            "characteristicvaluechanged",
+            (event) => {
+              console.log("epd ret", bytesToHex(event.target.value.buffer));
+              const count = parseInt(
+                "0x" + bytesToHex(event.target.value.buffer)
+              );
+              addLog(`> [From display]: Received ${count} bytes`);
+            }
+          );
+
+          document.getElementById("connectbutton").innerHTML = "Disconnect";
+          await connectRXTX();
+        }
+      }
+
+      function setStatus(statusText) {
+        document.getElementById("status").innerHTML = statusText;
+      }
+
+      function addLog(logTXT) {
+        const today = new Date();
+        const time =
+          ("0" + today.getHours()).slice(-2) +
+          ":" +
+          ("0" + today.getMinutes()).slice(-2) +
+          ":" +
+          ("0" + today.getSeconds()).slice(-2) +
+          ": ";
+
+        const dom = document.getElementById("log");
+
+        dom.innerHTML += `<pre><code>${time + logTXT}</code></pre>`;
+        dom.scrollTop = dom.scrollHeight;
+      }
+
+      function getUnixTime() {
+        const hourOffset = document.getElementById("hour-offset").value;
+        const unixNow =
+          Math.round(Date.now() / 1000) +
+          60 * 60 * hourOffset -
+          new Date().getTimezoneOffset() * 60;
+
+        const date = new Date(
+          (unixNow + new Date().getTimezoneOffset() * 60) * 1000
+        );
+        const localeTimeString = date.toLocaleTimeString();
+
+        return {
+          unixNow,
+          localeTimeString,
+          year: date.getFullYear(),
+          month: date.getMonth() + 1,
+          day: date.getDate(),
+          week: date.getDay() || 7,
+        };
+      }
+
+      async function update_image() {
+        const image_file = document.getElementById("image_file");
+        if (image_file.files.length > 0) {
+          const file = image_file.files[0];
+
+          const canvas = document.getElementById("canvas");
+          const ctx = canvas.getContext("2d");
+
+          const image = new Image();
+          image.src = URL.createObjectURL(file);
+          image.onload = function (event) {
+            URL.revokeObjectURL(this.src);
+            ctx.drawImage(
+              image,
+              0,
+              0,
+              image.width,
+              image.height,
+              0,
+              0,
+              canvas.width,
+              canvas.height
+            );
+            // Snapshot original pixels so mode switches restart from source
+            gOriginalImageData = ctx.getImageData(
+              0,
+              0,
+              canvas.width,
+              canvas.height
+            );
+            convert_dithering();
+          };
+        }
+      }
+
+      function get_position(canvas, x, y) {
+        let rect = canvas.getBoundingClientRect();
+        return {
+          x: x - rect.left * (canvas.width / rect.width),
+          y: y - rect.top * (canvas.height / rect.height),
+        };
+      }
+
+      function clear_canvas() {
+        if (confirm("Clear canvas?")) {
+          const canvas = document.getElementById("canvas");
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+      }
+
+      function convert_dithering() {
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+        const mode = document.getElementById("dithering").value;
+        // Always re-render from the original image if available
+        if (gOriginalImageData) {
+          ctx.putImageData(gOriginalImageData, 0, 0);
+        }
+
+        const serp = document.getElementById("dithSerp")
+          ? document.getElementById("dithSerp").checked
+          : false;
+
+        // RgbQuant-powered modes use prefixes bw_/bwr_
+        const isBwr = mode.startsWith("bwr_");
+        const palette = isBwr ? bwrPalette : bwPalette;
+        const kern = mode.split("_")[1];
+        const opts = { dithSerp: serp };
+
+        ditheringCanvasByPalette(canvas, palette, kern, opts);
+      }
+
+      document.body.onload = () => {
+        setInterval(() => {
+          const { localeTimeString, year, month, day, week } = getUnixTime();
+          document.getElementById(
+            "time-setter"
+          ).innerText = `Set time to: ${year}-${month}-${day} ${localeTimeString} Weekday ${week}`;
+        }, 1000);
+
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        let is_allow_drawing = false;
+        let is_allow_move_editor = false;
+        const image_mode = document.getElementById("canvas-mode");
+        const paint_size = document.getElementById("paint-size");
+        const paint_color = document.getElementById("paint-color");
+        const editor = document.getElementById("edit-font");
+        const font = document.getElementById("font");
+
+        document.getElementById("dithering").value = "bwr_Atkinson";
+
+        document
+          .getElementById("dithering")
+          .addEventListener("change", convert_dithering);
+        const serpCk = document.getElementById("dithSerp");
+        if (serpCk) serpCk.addEventListener("change", convert_dithering);
+        const thr = document.getElementById("threshold");
+        if (thr) thr.addEventListener("change", convert_dithering);
+
+        image_mode.value = "paint";
+        paint_color.value = "black";
+        font.value = "黑体";
+
+        editor.onmousemove = function (e) {
+          editor.style.fontSize = `${paint_size.value * 10}px`;
+          editor.style.color = paint_color.value;
+          editor.style.fontFamily = font.value;
+          editor.style.fontWeight = "bold";
+
+          if (is_allow_move_editor) {
+            const { x, y } = get_position(canvas, e.clientX, e.clientY);
+            if (x < 0 || y < 0 || x > canvas.width || y > canvas.height) {
+              return;
+            }
+
+            editor.style.left = `${e.clientX - 20}px`;
+            editor.style.top = `${e.clientY - 20}px`;
+          }
+        };
+
+        editor.onmousedown = function (e) {
+          is_allow_move_editor = true;
+        };
+
+        editor.onmouseup = function (e) {
+          is_allow_move_editor = false;
+        };
+
+        document.getElementById("update-text").onclick = function () {
+          if (!editor.value.length) {
+            alert("Please enter text");
+            return;
+          }
+          editor.style.display = "none";
+          ctx.beginPath();
+          ctx.font = `bold ${paint_size.value * 10}px ${font.value}`;
+          ctx.fillStyle = paint_color.value;
+          const { x, y } = get_position(
+            canvas,
+            parseInt(editor.style.left),
+            parseInt(editor.style.top) + paint_size.value * 10
+          );
+
+          ctx.fillText(editor.value, x, y);
+        };
+
+        image_mode.onchange = function (e) {
+          if (image_mode.value === "font") {
+            document.getElementById("update-text").style.display =
+              "inline-block";
+            document.getElementById("font").style.display = "inline-block";
+
+            editor.style.display = "block";
+            editor.style.left = `${e.clientX}px`;
+            editor.style.top = `${e.clientY}px`;
+            return;
+          }
+          document.getElementById("update-text").style.display = "none";
+          document.getElementById("font").style.display = "none";
+          editor.style.display = "none";
+        };
+
+        paint_size.onchange = function () {
+          if (image_mode.value === "font") {
+            editor.style.fontSize = `${paint_size.value * 10}px`;
+          }
+        };
+
+        paint_color.onchange = function () {
+          if (image_mode.value === "font") {
+            editor.style.color = paint_color.value;
+          }
+        };
+
+        font.onchange = function () {
+          if (image_mode.value === "font") {
+            editor.style.fontFamily = font.value;
+          }
+        };
+
+        canvas.onmousedown = function (e) {
+          let ele = get_position(canvas, e.clientX, e.clientY);
+          let { x, y } = ele;
+
+          switch (image_mode.value) {
+            case "paint":
+              is_allow_drawing = true;
+              ctx.beginPath();
+              ctx.moveTo(x, y);
+              break;
+            case "font":
+              editor.style.display = "block";
+              editor.style.left = `${e.clientX}px`;
+              editor.style.top = `${e.clientY}px`;
+              editor.style.fontSize = `${paint_size.value * 10}px`;
+              editor.style.color = paint_color.value;
+              editor.style.fontFamily = font.value;
+              editor.style.fontWeight = "bold";
+
+              break;
+            default:
+              break;
+          }
+        };
+
+        canvas.onmousemove = (e) => {
+          let ele = get_position(canvas, e.clientX, e.clientY);
+          let { x, y } = ele;
+          switch (image_mode.value) {
+            case "paint":
+              if (is_allow_drawing) {
+                ctx.lineWidth = paint_size.value;
+                ctx.strokeStyle = paint_color.value;
+                ctx.lineTo(x, y);
+                ctx.stroke();
+              }
+              break;
+            case "font":
+              break;
+
+            default:
+              break;
+          }
+        };
+
+        canvas.onmouseup = function () {
+          switch (image_mode.value) {
+            case "paint":
+              is_allow_drawing = false;
+              break;
+
+            case "font":
+              editor.focus();
+              is_allow_move_editor = false;
+              break;
+
+            default:
+              break;
+          }
+        };
+
+        canvas.onmouseleave = function () {
+          if (image_mode.value === "paint") {
+            is_allow_drawing = false;
+          }
+        };
+      };
+    </script>
+    <div class="min-h-screen bg-base-100">
+      <div class="container mx-auto p-6">
+        <!-- Header -->
+        <div class="flex items-center justify-between flex-wrap gap-3 mb-6">
+          <h1 class="text-2xl font-bold tracking-tight">
+            Electronic Shelf Label Bluetooth Controller
+          </h1>
+          <nav class="flex gap-2">
+            <a class="btn btn-ghost btn-sm" href="uart_flasher.html"
+              >UART Flasher</a
+            >
+            <a class="btn btn-ghost btn-sm" href="ATC_TLSR_PaperBLEcontrol.html"
+              >BLE OTA Upgrade</a
+            >
+            <a class="btn btn-accent btn-sm" href="weather.html"
+              >Weather Tool</a
+            >
+          </nav>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+          <!-- Left column -->
+          <div class="lg:col-span-2 space-y-6">
+            <!-- Connection card -->
+            <div class="card bg-base-200 shadow-sm">
+              <div class="card-body gap-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <button
+                    id="connectbutton"
+                    type="button"
+                    class="btn btn-primary"
+                    onclick="preConnect();"
+                  >
+                    Connect
+                  </button>
+                  <button type="button" class="btn" onclick="reConnect();">
+                    Reconnect
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    onclick="document.getElementById('log').innerHTML = '';"
+                  >
+                    Clear log
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Commands card -->
+            <div class="card bg-base-200 shadow-sm">
+              <div class="card-body gap-3">
+                <div class="flex items-end gap-2 flex-wrap">
+                  <div class="join">
+                    <label
+                      for="cmdTXT"
+                      class="btn btn-active join-item pointer-events-none"
+                    >
+                      EPD Command
+                    </label>
+                    <input
+                      class="input input-bordered join-item"
+                      type="text"
+                      id="cmdTXT"
+                      value="0055"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    onclick="triggerEpdCmd(document.getElementById('cmdTXT').value);"
+                  >
+                    Send EPD Cmd
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-accent"
+                    onclick="triggerRxTxCmd(document.getElementById('cmdTXT').value);"
+                  >
+                    Send RxTx Cmd
+                  </button>
+                </div>
+                
+                <div class="flex flex-wrap gap-2 mt-2">
+                  <button
+                    class="btn btn-info"
+                    type="button"
+                    title="Query internal tag time to measure drift"
+                    onclick="triggerRxTxCmd('e2ac')"
+                  >
+                    Check Clock Drift (E2 AC)
+                  </button>
+                </div>
+
+                <div class="divider my-2"></div>
+
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    class="btn btn-outline"
+                    type="button"
+                    title="Click this button, then upload an image. The image will be permanently displayed on the screen"
+                    onclick="triggerRxTxCmd('e100')"
+                  >
+                    Set Image Mode
+                  </button>
+                  <button
+                    class="btn btn-outline"
+                    type="button"
+                    title="Click this button to switch to Clock Mode"
+                    onclick="triggerRxTxCmd('e101')"
+                  >
+                    Set Clock Mode 1
+                  </button>
+                  <button
+                    class="btn btn-outline"
+                    type="button"
+                    title="Click this button to switch to Clock Mode"
+                    onclick="triggerRxTxCmd('e102')"
+                  >
+                    Set Clock Mode 2
+                  </button>
+                </div>
+
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    class="btn btn-error"
+                    type="button"
+                    onclick="clearScreen('00')"
+                  >
+                    Clear Screen (All Black)
+                  </button>
+                  <button class="btn" type="button" onclick="clearScreen('ff')">
+                    Clear Screen (All White)
+                  </button>
+                  <button
+                    class="btn btn-success"
+                    type="button"
+                    onclick="triggerEpdCmd('0101')"
+                  >
+                    Refresh (Full Update)
+                  </button>
+                  <button
+                    class="btn btn-success btn-outline"
+                    type="button"
+                    onclick="triggerEpdCmd('0100')"
+                  >
+                    Refresh (Partial)
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Upload + Dithering card -->
+            <div class="card bg-base-200 shadow-sm">
+              <div class="card-body gap-4">
+                <h3 class="card-title">Upload image to display</h3>
+                <div class="flex items-end gap-3 flex-wrap">
+                  <div class="form-control">
+                    <label class="label"
+                      ><span class="label-text">Choose image</span></label
+                    >
+                    <input
+                      class="file-input file-input-bordered file-input-sm"
+                      type="file"
+                      id="image_file"
+                      onchange="update_image()"
+                      accept=".png,.jpg,.bmp,.webp"
+                    />
+                  </div>
+
+                  <div class="form-control">
+                    <label class="label"
+                      ><span class="label-text">Dithering</span></label
+                    >
+                    <select
+                      id="dithering"
+                      title="Dithering algorithm"
+                      class="select select-bordered select-sm w-60"
+                    >
+                      <optgroup label="BW">
+                        <option value="bw_FloydSteinberg">
+                          FloydSteinberg
+                        </option>
+                        <option value="bw_FalseFloydSteinberg">
+                          FalseFloydSteinberg
+                        </option>
+                        <option value="bw_Stucki">Stucki</option>
+                        <option value="bw_Atkinson">Atkinson</option>
+                        <option value="bw_Jarvis">Jarvis</option>
+                        <option value="bw_Burkes">Burkes</option>
+                        <option value="bw_Sierra">Sierra</option>
+                        <option value="bw_TwoSierra">TwoSierra</option>
+                        <option value="bw_SierraLite">SierraLite</option>
+                      </optgroup>
+                      <optgroup label="BWR">
+                        <option value="bwr_FloydSteinberg">
+                          FloydSteinberg
+                        </option>
+                        <option value="bwr_FalseFloydSteinberg">
+                          FalseFloydSteinberg
+                        </option>
+                        <option value="bwr_Stucki">Stucki</option>
+                        <option value="bwr_Atkinson">Atkinson</option>
+                        <option value="bwr_Jarvis">Jarvis</option>
+                        <option value="bwr_Burkes">Burkes</option>
+                        <option value="bwr_Sierra">Sierra</option>
+                        <option value="bwr_TwoSierra">TwoSierra</option>
+                        <option value="bwr_SierraLite">SierraLite</option>
+                      </optgroup>
+                    </select>
+                  </div>
+
+                  <label class="label cursor-pointer gap-2 mt-6">
+                    <input
+                      type="checkbox"
+                      id="dithSerp"
+                      class="checkbox checkbox-sm"
+                    />
+                    <span class="label-text">Serpentine</span>
+                  </label>
+
+                  <div class="form-control">
+                    <label class="label"
+                      ><span class="label-text">Threshold</span></label
+                    >
+                    <input
+                      type="number"
+                      max="255"
+                      min="0"
+                      value="125"
+                      id="threshold"
+                      class="input input-bordered input-sm w-24"
+                    />
+                  </div>
+
+                  <button class="btn btn-sm" onclick="update_image()">
+                    Reload Image
+                  </button>
+                </div>
+
+                <!-- Canvas & tools -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+                  <div>
+                    <div
+                      id="tool-box"
+                      class="flex flex-wrap items-center gap-2 mb-3"
+                    >
+                      <div class="form-control">
+                        <label class="label"
+                          ><span class="label-text">Mode</span></label
+                        >
+                        <select
+                          id="canvas-mode"
+                          class="select select-bordered select-sm"
+                        >
+                          <option value="paint">Brush</option>
+                          <option
+                            value="font"
+                            title="After typing, click: Save Text Box"
+                          >
+                            Text
+                          </option>
+                        </select>
+                      </div>
+
+                      <div class="form-control">
+                        <label class="label"
+                          ><span class="label-text"
+                            >Brush/Text Size</span
+                          ></label
+                        >
+                        <input
+                          type="number"
+                          max="13"
+                          min="1"
+                          step="1"
+                          value="3"
+                          id="paint-size"
+                          class="input input-bordered input-sm w-24"
+                        />
+                      </div>
+
+                      <div class="form-control">
+                        <label class="label"
+                          ><span class="label-text">Color</span></label
+                        >
+                        <select
+                          id="paint-color"
+                          class="select select-bordered select-sm"
+                        >
+                          <option value="red">Red</option>
+                          <option value="white">White</option>
+                          <option value="black">Black</option>
+                        </select>
+                      </div>
+
+                      <button
+                        id="update-text"
+                        style="display: none"
+                        class="btn btn-sm"
+                      >
+                        Save Text Box
+                      </button>
+                      <button class="btn btn-sm" onclick="clear_canvas()">
+                        Clear Canvas
+                      </button>
+                    </div>
+
+                    <input
+                      id="edit-font"
+                      class="input input-bordered absolute bg-transparent overflow-auto"
+                      style="max-width: 250px; display: none"
+                    />
+                    <div class="border rounded-lg p-2 inline-block bg-white">
+                      <canvas
+                        id="canvas"
+                        width="250"
+                        height="128"
+                        class="eink border border-base-300 rounded"
+                      ></canvas>
+                    </div>
+                    <div class="mt-3">
+                      <button class="btn btn-primary" onclick="upload_image()">
+                        Upload to Display Now
+                      </button>
+                    </div>
+                  </div>
+
+                  <!-- Help panel -->
+                  <div class="text-sm opacity-80">
+                    <div class="font-semibold mb-1">Tips</div>
+                    <ul class="list-disc pl-5 space-y-1">
+                      <li>Use BWR dithering for 3‑color displays.</li>
+                      <li>
+                        Brush draws directly on canvas; Text lets you place and
+                        save a text box.
+                      </li>
+                      <li>
+                        After "Set Image Mode", upload to persist the image.
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Time card -->
+            <div class="card bg-base-200 shadow-sm">
+              <div class="card-body gap-3">
+                <h3 class="card-title">Set Time</h3>
+                <div class="flex items-center gap-3 flex-wrap">
+                  <button
+                    id="time-setter"
+                    class="btn btn-primary"
+                    onclick="setTime()"
+                  >
+                    Set time to:
+                  </button>
+                  <div class="form-control">
+                    <label class="label"
+                      ><span class="label-text">Offset (hours)</span></label
+                    >
+                    <div class="join">
+                      <span class="join-item btn btn-ghost no-animation"
+                        >+</span
+                      >
+                      <input
+                        type="number"
+                        max="24"
+                        min="0"
+                        id="hour-offset"
+                        value="0"
+                        class="join-item input input-bordered w-20"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Display buffer card -->
+            <div class="card bg-base-200 shadow-sm">
+              <div class="card-body gap-3">
+                <h3 class="card-title">Display Control</h3>
+                <div class="flex items-end gap-3 flex-wrap">
+                  <input
+                    type="file"
+                    class="file-input file-input-bordered file-input-sm"
+                  />
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    onclick="upload_epd_buffer();"
+                  >
+                    Upload image to display buffer
+                  </button>
+                </div>
+                <textarea
+                  id="buffer"
+                  rows="10"
+                  class="textarea textarea-bordered w-full"
+                  placeholder="Paste hex buffer..."
+                ></textarea>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right column: Log -->
+          <div class="card bg-base-200 shadow-sm h-full">
+            <div class="card-body gap-3">
+              <div class="flex items-center justify-between">
+                <h3 class="card-title text-base">Log</h3>
+                <button
+                  class="btn btn-sm"
+                  type="button"
+                  onclick="document.getElementById('log').innerHTML = '';"
+                >
+                  Clear
+                </button>
+              </div>
+              <div
+                id="log"
+                class="text-[lime] rounded h-[60vh] overflow-auto mockup-code font-mono text-xs"
+              ></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BWR e‑ink 250×128</title>
+    <script type="application/javascript" src="js/dithering.js"></script>
+    <script type="application/javascript" src="js/utils.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/daisyui@5"
+      rel="stylesheet"
+      type="text/css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/rgbquant/src/rgbquant.min.js"></script>
+    <style>
+      .eink {
+        color: #000;
+        background: #fff;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+      }
+
+      .ink-red {
+        color: #f00;
+      }
+
+      .snap,
+      #capture {
+        image-rendering: pixelated;
+      }
+
+      body {
+        line-height: 0.5 !important;
+      }
+
+      #capture,
+      .ui {
+        line-height: normal;
+      }
+
+      #capture span {
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+      }
+
+      #capture svg path,
+      #capture svg line {
+        stroke: red;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen">
+    <div id="app" v-scope class="p-6 max-w-6xl mx-auto">
+      <!-- App header -->
+      <header class="mb-6 flex flex-col gap-1">
+        <div class="flex items-center gap-3 flex-wrap">
+          <h1 class="text-2xl font-bold tracking-tight">
+            Stellar E‑Ink Weather
+          </h1>
+          <div v-if="bleConnected" class="badge badge-accent">Connected</div>
+          <div v-else class="badge badge-neutral">Disconnected</div>
+        </div>
+      </header>
+      <div class="grid grid-cols-2 lg:grid-cols-3 gap-6 items-start">
+        <!-- Left: controls + preview + canvas -->
+        <div class="lg:col-span-2 space-y-4">
+          <!-- Controls card -->
+          <div class="ui card bg-base-200 rounded-xl p-6">
+            <div class="flex flex-col gap-3 flex-wrap">
+              <div class="flex flex-col flex-grow gap-3">
+                <label class="input">
+                  <span class="label"> Location </span>
+                  <input
+                    v-model.trim="location"
+                    placeholder="City or lat, lon"
+                    @change="saveLocation"
+                    @blur="saveLocation"
+                  />
+                </label>
+
+                <label class="label">
+                  <input
+                    type="checkbox"
+                    class="checkbox"
+                    v-model="use24h"
+                    @change="saveUse24h"
+                  />
+                  Clock 24h
+                </label>
+              </div>
+
+              <div class="flex gap-2 flex-wrap items-end">
+                <button
+                  @click="fetchWeather"
+                  class="btn btn-primary"
+                  aria-label="Fetch latest weather"
+                >
+                  Fetch
+                </button>
+                <button
+                  @click="renderToCanvas"
+                  class="btn btn-primary"
+                  aria-label="Render to preview"
+                >
+                  Render
+                </button>
+                <button
+                  @click="preConnect"
+                  class="btn btn-primary"
+                  aria-label="Connect / Disconnect"
+                >
+                  {{ bleConnected ? 'Disconnect' : 'Connect' }}
+                </button>
+                <button
+                  @click="reConnect"
+                  :disabled="!bleDevice"
+                  class="btn btn-primary"
+                  aria-label="Reconnect to device"
+                >
+                  Reconnect
+                </button>
+              </div>
+
+              <div class="flex items-start gap-1">
+                <div class="flex items-center gap-2">
+                  <label class="input">
+                    <span class="label">Dev Temp</span>
+                    <input
+                      v-model.trim="tempCmd"
+                      @change="saveTempCmd"
+                      placeholder="hex"
+                    />
+                  </label>
+                  <button
+                    @click="queryDeviceTemp"
+                    class="btn btn-primary"
+                    aria-label="Read device temperature"
+                  >
+                    Read
+                  </button>
+                </div>
+                <div class="leading-none">
+                  🏠<span v-if="deviceTempDisplay"
+                    >{{ deviceTempDisplay }}</span
+                  >
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="flex gap-5">
+            <div class="flex flex-col items-start">
+              <div class="text-sm mb-1 text-center">Preview card:</div>
+              <!-- Preview card -->
+              <div class="bg-white border rounded-xl shadow-sm overflow-hidden">
+                <div
+                  id="capture"
+                  class="eink snap w-[250px] h-[128px] flex flex-col px-1 pt-0 pb-0 gap-0"
+                >
+                  <!-- Top half (Current) -->
+                  <div class="flex flex-row gap-1 h-[60px] border-b-[2px] border-black items-center">
+                    <!-- Icon column -->
+                    <div class="w-[52px] flex items-center justify-center">
+                      <div
+                        v-if="iconSvg"
+                        v-html="iconSvg"
+                        class="size-[48px]"
+                      ></div>
+                    </div>
+                    <!-- Middle column -->
+                    <div class="flex flex-col justify-center flex-1 pr-1 gap-1">
+                      <div class="text-[12px] leading-none truncate max-w-full font-bold">
+                        {{ weekday }} | {{ locationLabel }}
+                      </div>
+                      <div class="flex items-center justify-start mt-[-2px]">
+                        <div class="font-black tracking-tight leading-none text-[34px]">
+                          {{ timeMain }}
+                          <span
+                            v-if="timeSuffix"
+                            class="text-[14px] font-bold align-top ml-[-2px]"
+                            >{{ timeSuffix }}</span
+                          >
+                        </div>
+                      </div>
+                    </div>
+                    <!-- Right column -->
+                    <div class="flex flex-col items-end justify-start pt-1 w-[72px] gap-1 pr-1">
+                      <div class="text-[22px] font-extrabold leading-none">{{ roundedTemp }}°C</div>
+                      <div v-if="dailyRainChance != null" class="flex items-center gap-1 mt-0">
+                        <span class="text-[24px] leading-none">☔</span>
+                        <span class="text-[22px] font-black leading-none">{{ dailyRainChance }}%</span>
+                      </div>
+                    </div>
+                  </div>
+                  <!-- Bottom half (Hourly 4 blocks) -->
+                  <div class="flex flex-row justify-between h-[66px] items-end pb-[2px] px-2 mt-0">
+                    <div v-for="forecast in hourlyForecast" class="flex flex-col items-center justify-center w-[54px] leading-none gap-0">
+                      <div class="text-[12px] font-extrabold">{{ forecast.time }}</div>
+                      <div class="size-[30px] my-[2px]" v-html="forecast.icon"></div>
+                      <div class="text-[12px] font-extrabold">{{ forecast.temp }}°C</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Canvas -->
+            <div class="flex flex-col items-start">
+              <div class="text-sm mb-1 text-center">
+                Rendered canvas (1×, 250×128):
+              </div>
+              <div class="flex justify-center">
+                <canvas
+                  id="outCanvas"
+                  width="250"
+                  height="128"
+                  class="border border-dashed rounded-md bg-white"
+                ></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: BLE log -->
+        <div class="rounded-xl bg-base-200 p-4 space-y-2">
+          <div class="flex items-center justify-between">
+            <div class="text-xs font-semibold tracking-wide">BLE Log</div>
+            <button
+              @click="clearBleLog"
+              class="btn btn-primary btn-sm"
+              aria-label="Clear BLE log"
+            >
+              Clear
+            </button>
+          </div>
+          <div
+            id="bleLog"
+            class="text-[11px] bg-black text-[lime] min-h-64 max-h-[70vh] overflow-y-auto rounded p-2 font-mono leading-snug"
+          ></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas-pro@1.5.11/dist/html2canvas-pro.min.js"></script>
+
+    <script>
+      // ==== BLE logic (adapted from index.html) ====
+      let bleDevice;
+      let gattServer;
+      let epdService;
+      let rxtxService;
+      let epdCharacteristic;
+      let rxtxCharacteristic;
+      let reconnectTrys = 0;
+      let autoConnectAttempts = 0;
+
+      // addBleLog moved into App for reactivity
+
+      function resetVariables() {
+        gattServer = null;
+        epdService = null;
+        epdCharacteristic = null;
+        rxtxCharacteristic = null;
+        rxtxService = null;
+      }
+
+      // Global BLE helper functions removed: logic moved into App methods for reactivity
+      function hexToBytes(hex) {
+        const clean = hex.replace(/\s|0x|,/gi, "");
+        if (clean.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(clean)) throw new Error("Invalid hex string");
+        const bytes = new Uint8Array(clean.length / 2);
+        for (let c = 0; c < clean.length; c += 2) bytes[c / 2] = parseInt(clean.slice(c, c + 2), 16);
+        return bytes;
+      }
+      function bytesToHex(data) {
+        return new Uint8Array(data).reduce((memo, i) => memo + ("0" + i.toString(16)).slice(-2), "");
+      }
+      function intToHex(intIn, bytes = 4) {
+        return intIn.toString(16).padStart(bytes * 2, "0");
+      }
+      function canvas2bytes(canvas, type = "bw") {
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return new Uint8Array(0);
+        const { width, height } = canvas;
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const data = imageData.data;
+        const totalBits = width * height;
+        const arr = new Uint8Array(Math.ceil(totalBits / 8));
+        let byteIndex = 0, byte = 0, bitCount = 0;
+        for (let x = width - 1; x >= 0; x--) {
+          for (let y = 0; y < height; y++) {
+            const index = (width * y + x) * 4;
+            let bit;
+            if (type !== "bwr") bit = (data[index] > 0 && data[index + 1] > 0 && data[index + 2] > 0) ? 1 : 0;
+            else bit = (data[index] > 0 && data[index + 1] === 0 && data[index + 2] === 0) ? 1 : 0;
+            byte = (byte << 1) | bit;
+            bitCount++;
+            if (bitCount === 8) {
+              arr[byteIndex++] = byte;
+              byte = 0;
+              bitCount = 0;
+            }
+          }
+        }
+        if (bitCount > 0) arr[byteIndex] = byte << (8 - bitCount);
+        return arr;
+      }
+
+      const bwrPalette = [[0, 0, 0], [255, 255, 255], [255, 0, 0]];
+      const bwPalette = [[0, 0, 0], [255, 255, 255]];
+
+      async function bufferIntoImageData(data) {
+        if (typeof ImageData !== 'undefined' && data instanceof ImageData) return data;
+        if (typeof HTMLCanvasElement !== 'undefined' && data instanceof HTMLCanvasElement) {
+          const ctx = data.getContext('2d', { willReadFrequently: true });
+          if (!ctx) throw new Error('Canvas 2D context not available');
+          return ctx.getImageData(0, 0, data.width, data.height);
+        }
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) throw new Error('Canvas context is not available.');
+        return new Promise((resolve, reject) => {
+          const blob = data instanceof Blob ? data : new Blob([data], { type: 'image/png' });
+          const url = URL.createObjectURL(blob);
+          const image = new Image();
+          image.onload = () => {
+            try {
+              canvas.width = image.width;
+              canvas.height = image.height;
+              context.drawImage(image, 0, 0);
+              resolve(context.getImageData(0, 0, image.width, image.height));
+            } finally {
+              URL.revokeObjectURL(url);
+            }
+          };
+          image.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error('Failed to decode image.'));
+          };
+          image.src = url;
+        });
+      }
+
+      async function ditheringCanvasByPalette(canvas, palette, kern, opts = {}) {
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return;
+        const w = canvas.width;
+        const h = canvas.height;
+        const { dithSerp } = opts;
+        const quantOptions = { palette, dithKern: kern || 'Atkinson', dithSerp, minHueCols: 256, method: 1, initColors: 16000 };
+        const quant = new RgbQuant(quantOptions);
+        quant.sample(canvas);
+        quant.palette();
+        const output = quant.reduce(canvas);
+        if ((output instanceof Uint8Array || output instanceof Uint8ClampedArray) && output.length === w * h * 4) {
+          ctx.putImageData(new ImageData(new Uint8ClampedArray(output), w, h), 0, 0);
+          return;
+        }
+        try {
+          const imageDataConv = await bufferIntoImageData(output);
+          ctx.putImageData(imageDataConv, 0, 0);
+        } catch (e) {
+          console.error('Quant output could not be decoded:', e);
+        }
+      }
+
+      function describeWMO(code) {
+        const map = new Map([
+          [0, "Clear sky"],
+          [1, "Mainly clear"],
+          [2, "Partly cloudy"],
+          [3, "Overcast"],
+          [45, "Fog"],
+          [48, "Depositing rime fog"],
+          [51, "Light drizzle"],
+          [53, "Moderate drizzle"],
+          [55, "Dense drizzle"],
+          [56, "Light freezing drizzle"],
+          [57, "Dense freezing drizzle"],
+          [61, "Light rain"],
+          [63, "Moderate rain"],
+          [65, "Heavy rain"],
+          [66, "Light freezing rain"],
+          [67, "Heavy freezing rain"],
+          [71, "Light snowfall"],
+          [73, "Moderate snowfall"],
+          [75, "Heavy snowfall"],
+          [77, "Snow grains"],
+          [80, "Slight rain showers"],
+          [81, "Moderate rain showers"],
+          [82, "Violent rain showers"],
+          [85, "Slight snow showers"],
+          [86, "Heavy snow showers"],
+          [95, "Thunderstorm"],
+          [96, "Thunderstorm w/ slight hail"],
+          [99, "Thunderstorm w/ heavy hail"],
+        ]);
+        if (map.has(code)) return map.get(code);
+        return `Code ${code}`;
+      }
+
+      function dirToCardinal(deg) {
+        if (deg == null || isNaN(deg)) return "";
+        const dirs = [
+          "N",
+          "NNE",
+          "NE",
+          "ENE",
+          "E",
+          "ESE",
+          "SE",
+          "SSE",
+          "S",
+          "SSW",
+          "SW",
+          "WSW",
+          "W",
+          "WNW",
+          "NW",
+          "NNW",
+        ];
+        return dirs[Math.round(deg / 22.5) % 16];
+      }
+
+      function parseTemperatureFromBytes(bytes) {
+        if (!bytes || bytes.length === 0) return null;
+        // Try strategies: ASCII digits, signed int16, single signed int8
+        // 1. ASCII detection
+        const ascii = Array.from(bytes).every((b) => b >= 32 && b <= 126);
+        if (ascii) {
+          const txt = new TextDecoder().decode(bytes).trim();
+          const m = txt.match(/(-?\d+(?:\.\d+)?)/);
+          if (m) return parseFloat(m[1]);
+        }
+        // 2. If 2 bytes -> int16 little endian maybe times 100 or 10
+        if (bytes.length === 2) {
+          const view = new DataView(bytes.buffer);
+          let v = view.getInt16(0, true);
+          // Firmware sends temp * 10 (signed). Convert to °C.
+          return v / 10;
+        }
+        // 3. Single byte signed
+        if (bytes.length === 1) {
+          let b = bytes[0];
+          if (b > 127) b = b - 256;
+          return b;
+        }
+        return null;
+      }
+
+      const App = {
+        location: (function () {
+          try {
+            const v = localStorage.getItem("weatherLocation");
+            return v && v.trim() ? v : "Barcelona";
+          } catch (e) {
+            return "Barcelona";
+          }
+        })(),
+        units: "metric",
+        now: new Date(),
+        temp: null,
+        code: null,
+        tzId: null,
+        tzAbbr: null,
+        cityLocale: null,
+        use24h: (function () {
+          try {
+            const v = localStorage.getItem("use24h");
+            if (v !== null) return v === "true";
+          } catch (e) {}
+          return true; // default to 24h
+        })(),
+        windSpeed: null,
+        windDir: null,
+        deviceTemp: null,
+        hourlyForecast: [],
+        dailyRainChance: null,
+        tempCmd: (function () {
+          try {
+            return localStorage.getItem("tempCmd") || "e2aa";
+          } catch (e) {
+            return "e2aa";
+          }
+        })(),
+        bleConnected: false,
+        get bleDevice() {
+          return bleDevice;
+        },
+        get weekday() {
+          const opts = { weekday: "long" };
+          if (this.tzId) opts.timeZone = this.tzId;
+          return this.now.toLocaleDateString(
+            this.cityLocale || undefined,
+            opts
+          );
+        },
+        get dateStr() {
+          const opts = { year: "numeric", month: "short", day: "numeric" };
+          if (this.tzId) opts.timeZone = this.tzId;
+          return this.now.toLocaleDateString(
+            this.cityLocale || undefined,
+            opts
+          );
+        },
+        get timeStr() {
+          // legacy full string
+          const opts = { hour: "2-digit", minute: "2-digit" };
+          if (this.tzId) opts.timeZone = this.tzId;
+          return this.now.toLocaleTimeString(
+            this.cityLocale || undefined,
+            opts
+          );
+        },
+        get timeMain() {
+          const opts = {
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: !this.use24h,
+          };
+          if (this.tzId) opts.timeZone = this.tzId;
+          const parts = new Intl.DateTimeFormat(
+            this.cityLocale || undefined,
+            opts
+          ).formatToParts(this.now);
+          const hour = parts.find((p) => p.type === "hour")?.value || "";
+          const minute = parts.find((p) => p.type === "minute")?.value || "";
+          const sep =
+            parts.find((p) => p.type === "literal" && p.value.includes(":"))
+              ?.value || ":";
+          return `${hour}${sep}${minute}`;
+        },
+        get timeSuffix() {
+          if (this.use24h) return ""; // no AM/PM in 24h mode
+          const opts = { hour: "2-digit", minute: "2-digit", hour12: true };
+          if (this.tzId) opts.timeZone = this.tzId;
+          const parts = new Intl.DateTimeFormat(
+            this.cityLocale || undefined,
+            opts
+          ).formatToParts(this.now);
+          return (
+            parts.find((p) => p.type === "dayPeriod")?.value?.toUpperCase() ||
+            ""
+          );
+        },
+        get locationLabel() {
+          return this.location;
+        },
+        get roundedTemp() {
+          return this.temp == null ? "—" : Math.round(this.temp);
+        },
+        get weatherText() {
+          return this.code == null ? "" : describeWMO(this.code);
+        },
+        get iconCategory() {
+          const h = this.now.getHours();
+          const isNight = h >= 20 || h < 6;
+          return this.getCategoryFromCode(this.code, isNight);
+        },
+        get iconSvg() {
+          return this.getIconSvg(this.iconCategory, false);
+        },
+        get windSpeedDisplay() {
+          if (this.windSpeed == null) return "";
+          return Math.round(this.windSpeed) + "km/h";
+        },
+        get windDirDisplay() {
+          if (this.windDir == null) return "";
+          return dirToCardinal(this.windDir);
+        },
+        get deviceTempDisplay() {
+          if (this.deviceTemp == null) return "";
+          return Math.round(this.deviceTemp) + "°C";
+        },
+        async fetchWeather() {
+          try {
+            let lat = 41.3874;
+            let lon = 2.1686;
+
+            const m = this.location.match(
+              /^\s*(-?\d+\.?\d*),\s*(-?\d+\.?\d*)\s*$/
+            );
+
+            if (m) {
+              lat = parseFloat(m[1]);
+              lon = parseFloat(m[2]);
+            } else if (this.location.toLowerCase() !== "barcelona") {
+              const geoRes = await fetch(
+                `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
+                  this.location
+                )}`
+              );
+
+              const geoData = await geoRes.json();
+
+              console.log(geoData);
+
+              if (geoData.length > 0) {
+                const g0 = geoData[0];
+                lat = parseFloat(g0.lat);
+                lon = parseFloat(g0.lon);
+                this.location =
+                  g0.display_name?.split(",")[0] || g0.name || this.location;
+                // Attempt locale mapping from country code
+                if (g0.address && g0.address.country_code) {
+                  const cc = g0.address.country_code.toLowerCase();
+                  const localeMap = {
+                    es: "es-ES",
+                    us: "en-US",
+                    gb: "en-GB",
+                    fr: "fr-FR",
+                    de: "de-DE",
+                    it: "it-IT",
+                    pt: "pt-PT",
+                    br: "pt-BR",
+                    cn: "zh-CN",
+                    tw: "zh-TW",
+                    jp: "ja-JP",
+                    kr: "ko-KR",
+                    ru: "ru-RU",
+                    ua: "uk-UA",
+                    pl: "pl-PL",
+                    se: "sv-SE",
+                    no: "nb-NO",
+                    dk: "da-DK",
+                    fi: "fi-FI",
+                    nl: "nl-NL",
+                    be: "nl-BE",
+                    ch: "de-CH",
+                    at: "de-AT",
+                    ca: "en-CA",
+                    au: "en-AU",
+                    nz: "en-NZ",
+                    mx: "es-MX",
+                    ar: "es-AR",
+                    cl: "es-CL",
+                  };
+                  this.cityLocale = localeMap[cc] || cc;
+                }
+              }
+
+              this.saveLocation();
+            }
+
+            const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true&hourly=temperature_2m,weathercode,precipitation_probability&daily=precipitation_probability_max&timezone=auto`;
+            const res = await fetch(url);
+            const data = await res.json();
+
+            if (data.current_weather) {
+              this.temp = data.current_weather.temperature;
+              this.code = data.current_weather.weathercode;
+              this.windSpeed = data.current_weather.windspeed;
+              this.windDir = data.current_weather.winddirection;
+            }
+            if (data.daily && data.daily.precipitation_probability_max) {
+              this.dailyRainChance = data.daily.precipitation_probability_max[0];
+            }
+            if (data.hourly && data.hourly.time) {
+              const nowIso = data.current_weather.time; // "2023-10-12T14:00"
+              const currentIndex = data.hourly.time.findIndex(t => t >= nowIso) || 0;
+              this.hourlyForecast = [];
+              // Get next 4 hours
+              for (let i = 1; i <= 4; i++) {
+                const idx = currentIndex + i;
+                if (idx < data.hourly.time.length) {
+                  const tStr = data.hourly.time[idx];
+                  const tObj = new Date(tStr);
+                  let h = tObj.getHours();
+                  let min = "00";
+                  const code = data.hourly.weathercode[idx];
+                  const temp = Math.round(data.hourly.temperature_2m[idx]);
+                  const isNight = h >= 20 || h < 6;
+                  const cat = this.getCategoryFromCode(code, isNight);
+                  const icon = this.getIconSvg(cat, true);
+                  this.hourlyForecast.push({
+                    time: `${h}:${min}`,
+                    temp,
+                    icon
+                  });
+                }
+              }
+            }
+            if (data.timezone) {
+              this.tzId = data.timezone;
+              this.tzAbbr = data.timezone_abbreviation || null;
+            }
+            // If locale not set from geocode, try derive from timezone (e.g., Europe/Berlin -> de-DE)
+            if (!this.cityLocale && this.tzId) {
+              const tzPart = this.tzId.split("/")[0];
+              const regionLangMap = {
+                Europe: "en-GB",
+                Asia: "en-US",
+                America: "en-US",
+                Africa: "en-US",
+                Australia: "en-AU",
+              };
+              this.cityLocale = regionLangMap[tzPart] || undefined;
+            }
+
+            await this.renderToCanvas();
+            if (this.bleConnected) await this.uploadImage();
+          } catch (e) {
+            this.code = null;
+            this.temp = null;
+          }
+        },
+        saveLocation() {
+          try {
+            localStorage.setItem("weatherLocation", this.location || "");
+          } catch (e) {}
+        },
+        getCategoryFromCode(c, isNight) {
+          if (c == null) return null;
+          if (c === 0) return isNight ? "moon" : "sun";
+          if ([1, 2].includes(c)) return isNight ? "moon-cloud" : "sun-cloud";
+          if (c === 3) return "cloud";
+          if ([45, 48].includes(c)) return "fog";
+          if (c >= 51 && c <= 57) return "drizzle";
+          if ((c >= 61 && c <= 67) || [80, 81, 82].includes(c)) return "rain";
+          if ((c >= 71 && c <= 77) || [85, 86].includes(c)) return "snow";
+          if ([95].includes(c)) return "thunder";
+          if ([96, 99].includes(c)) return "thunder-hail";
+          return "cloud";
+        },
+        getIconSvg(cat, isSmall) {
+          const baseProps = isSmall
+            ? 'stroke="black" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"'
+            : 'stroke="black" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+          const small = isSmall ? 'stroke-width="3"' : 'stroke-width="2"';
+          const icons = {
+            sun: `<svg viewBox="0 0 64 64">\n <circle cx="32" cy="32" r="12" ${baseProps}/><g ${baseProps}>\n <line x1="32" y1="6" x2="32" y2="14"/>\n <line x1="32" y1="50" x2="32" y2="58"/>\n <line x1="6" y1="32" x2="14" y2="32"/>\n <line x1="50" y1="32" x2="58" y2="32"/>\n <line x1="13" y1="13" x2="19" y2="19"/>\n <line x1="45" y1="45" x2="51" y2="51"/>\n <line x1="13" y1="51" x2="19" y2="45"/>\n <line x1="45" y1="19" x2="51" y2="13"/>\n </g></svg>`,
+            moon: `<svg viewBox="0 0 64 64"><path d="M35 15A18 18 0 1 0 50 45A22 22 0 0 1 35 15Z" ${baseProps}/></svg>`,
+            cloud: `<svg viewBox="0 0 64 64"><path d="M20 46h26a10 10 0 0 0 0-20 16 16 0 0 0-31-2A10 10 0 0 0 20 46Z" ${baseProps}/></svg>`,
+            "sun-cloud": `<svg viewBox="0 0 64 64">\n <circle cx="22" cy="22" r="9" ${baseProps}/><path d="M20 50h22a9 9 0 0 0 0-18 14 14 0 0 0-27-2 9 9 0 0 0 5 20Z" ${baseProps.replace('fill="none"', 'fill="white"')}/></svg>`,
+            "moon-cloud": `<svg viewBox="0 0 64 64"><g transform="translate(-6, -4)"><path d="M24 16A12 12 0 1 0 34 36A14 14 0 0 1 24 16Z" ${baseProps}/></g><path d="M20 50h22a9 9 0 0 0 0-18 14 14 0 0 0-27-2 9 9 0 0 0 5 20Z" ${baseProps.replace('fill="none"', 'fill="white"')}/></svg>`,
+            fog: `<svg viewBox="0 0 64 64"><path d="M18 40h26a10 10 0 0 0 0-20 16 16 0 0 0-31-2A10 10 0 0 0 18 40Z" ${baseProps}/><line x1="12" y1="46" x2="52" y2="46" ${baseProps}/><line x1="16" y1="52" x2="48" y2="52" ${baseProps}/></svg>`,
+            drizzle: `<svg viewBox="0 0 64 64"><path d="M20 40h22a9 9 0 0 0 0-18 14 14 0 0 0-27-2A9 9 0 0 0 20 40Z" ${baseProps}/><g ${baseProps}>\n <line x1="22" y1="46" x2="20" y2="52"/>\n <line x1="32" y1="46" x2="30" y2="52"/>\n <line x1="42" y1="46" x2="40" y2="52"/>\n </g></svg>`,
+            rain: `<svg viewBox="0 0 64 64"><path d="M20 38h24a10 10 0 0 0 0-20 16 16 0 0 0-31-2A10 10 0 0 0 20 38Z" ${baseProps}/><g ${baseProps}>\n <line x1="22" y1="44" x2="18" y2="56"/>\n <line x1="32" y1="44" x2="28" y2="56"/>\n <line x1="42" y1="44" x2="38" y2="56"/>\n </g></svg>`,
+            snow: `<svg viewBox="0 0 64 64"><path d="M20 38h24a10 10 0 0 0 0-20 16 16 0 0 0-31-2A10 10 0 0 0 20 38Z" ${baseProps}/><g ${small} stroke="black" fill="none" stroke-linecap="round">\n <path d="M24 44l2 8"/><path d="M24 44l-2 8"/><path d="M32 44l2 8"/><path d="M32 44l-2 8"/><path d="M40 44l2 8"/><path d="M40 44l-2 8"/>\n </g></svg>`,
+            thunder: `<svg viewBox="0 0 64 64"><path d="M20 38h24a10 10 0 0 0 0-20 16 16 0 0 0-31-2A10 10 0 0 0 20 38Z" ${baseProps}/><polyline points="30 40 24 54 34 50 30 62" ${baseProps} /></svg>`,
+            "thunder-hail": `<svg viewBox="0 0 64 64"><path d="M20 36h24a10 10 0 0 0 0-20 16 16 0 0 0-31-2A10 10 0 0 0 20 36Z" ${baseProps}/><polyline points="30 38 24 52 34 48 30 60" ${baseProps} /><g ${baseProps}><circle cx="22" cy="46" r="2"/><circle cx="40" cy="46" r="2"/></g></svg>`,
+          };
+          return cat && icons[cat] ? icons[cat] : null;
+        },
+        saveUse24h() {
+          try {
+            localStorage.setItem("use24h", this.use24h ? "true" : "false");
+          } catch (e) {}
+          // Re-render after changing time format
+          this.renderToCanvas();
+        },
+        saveTempCmd() {
+          try {
+            localStorage.setItem("tempCmd", this.tempCmd);
+          } catch (e) {}
+        },
+        async queryDeviceTemp() {
+          if (!this.bleConnected || !this.tempCmd) return;
+
+          const cmd = this.tempCmd.replace(/\s+/g, "").toLowerCase();
+
+          if (!/^([0-9a-f]{2})+$/.test(cmd)) {
+            this.addBleLog("Temp cmd invalid hex");
+            return;
+          }
+          await this.triggerRxTxCmd(cmd);
+        },
+        // Injected BLE methods
+        addBleLog(msg) {
+          const box = document.getElementById("bleLog");
+          const ts = new Date();
+          const t = ts.toLocaleTimeString();
+          if (box) {
+            box.innerHTML += `[${t}] ${msg.replace(/</g, "&lt;")}<br>`;
+            box.scrollTop = box.scrollHeight;
+          } else console.log("[BLE]", msg);
+        },
+        clearBleLog() {
+          const box = document.getElementById("bleLog");
+          if (box) box.innerHTML = "";
+        },
+        async sendCommand(cmd) {
+          if (epdCharacteristic)
+            await epdCharacteristic.writeValueWithResponse(cmd);
+        },
+        async rxTxSendCommand(cmd) {
+          if (rxtxCharacteristic)
+            await rxtxCharacteristic.writeValueWithResponse(cmd);
+        },
+        async triggerRxTxCmd(cmd) {
+          this.addBleLog(`Tx RxTx: ${cmd}`);
+          await this.rxTxSendCommand(hexToBytes(cmd));
+        },
+        async sendBufferData(value, type) {
+          let code = "ff";
+          if (type === "bwr") code = "00";
+          const step = 480;
+          for (let i = 0; i < value.length; i += step) {
+            await this.sendCommand(
+              hexToBytes(
+                "03" + code + intToHex(i / 2, 2) + value.substring(i, i + step)
+              )
+            );
+          }
+        },
+        async uploadImage(canvasId = "outCanvas") {
+          if (!epdCharacteristic) return;
+          try {
+            const canvas = document.getElementById(canvasId);
+            this.addBleLog("Uploading image ...");
+            await this.sendCommand(hexToBytes("0000"));
+            await this.sendCommand(hexToBytes("020000"));
+            await this.sendBufferData(bytesToHex(canvas2bytes(canvas)), "bw");
+            await this.sendBufferData(
+              bytesToHex(canvas2bytes(canvas, "bwr")),
+              "bwr"
+            );
+            await this.sendCommand(hexToBytes("0101"));
+            this.addBleLog("Upload done");
+          } catch (e) {
+            this.addBleLog("Upload failed: " + e.message);
+          }
+        },
+        async preConnect() {
+          if (gattServer && gattServer.connected) {
+            if (bleDevice && bleDevice.gatt.connected)
+              bleDevice.gatt.disconnect();
+            return;
+          }
+          reconnectTrys = 0;
+          bleDevice = await navigator.bluetooth.requestDevice({
+            optionalServices: [
+              "0000221f-0000-1000-8000-00805f9b34fb",
+              "00001f10-0000-1000-8000-00805f9b34fb",
+              "13187b10-eba9-a3ba-044e-83d3217d9a38",
+            ],
+            acceptAllDevices: true,
+          });
+          bleDevice.addEventListener("gattserverdisconnected", () =>
+            this.disconnect()
+          );
+          try {
+            await this.connect();
+          } catch (e) {
+            await this.handleError(e);
+          }
+        },
+        async connectRXTX() {
+          try {
+            this.addBleLog("Getting RxTx primary service 1f10...");
+            rxtxService = await gattServer.getPrimaryService(
+              "00001f10-0000-1000-8000-00805f9b34fb"
+            );
+            this.addBleLog("Service 1f10 ok. Getting characteristic 1f1f...");
+            rxtxCharacteristic = await rxtxService.getCharacteristic(
+              "00001f1f-0000-1000-8000-00805f9b34fb"
+            );
+            this.addBleLog(
+              "Characteristic 1f1f obtained (props: " +
+                Object.keys(rxtxCharacteristic.properties)
+                  .filter((k) => rxtxCharacteristic.properties[k])
+                  .join(",") +
+                ")"
+            );
+            this.addBleLog("Starting notifications on 1f1f...");
+            await rxtxCharacteristic.startNotifications();
+            this.addBleLog("startNotifications() resolved");
+            rxtxCharacteristic.addEventListener(
+              "characteristicvaluechanged",
+              this.handleRxtxNotification
+            );
+            this.addBleLog("Listener attached. RXTX notifications on");
+          } catch (e) {
+            this.addBleLog("RXTX notify setup fail: " + e.message);
+            console.error(e);
+          }
+        },
+        async connect() {
+          if (!epdCharacteristic) {
+            try {
+              this.addBleLog("Connecting GATT ...");
+              gattServer = await bleDevice.gatt.connect();
+              this.addBleLog(
+                "GATT connected: " + (bleDevice.name || "Unnamed")
+              );
+              this.addBleLog("Getting EPD primary service ...");
+              epdService = await gattServer.getPrimaryService(
+                "13187b10-eba9-a3ba-044e-83d3217d9a38"
+              );
+              this.addBleLog("EPD service found. Getting characteristic ...");
+              epdCharacteristic = await epdService.getCharacteristic(
+                "4b646063-6264-f3a7-8941-e65356ea82fe"
+              );
+              this.addBleLog(
+                "EPD characteristic obtained. startNotifications..."
+              );
+              await epdCharacteristic.startNotifications();
+              this.addBleLog(
+                "EPD notifications (if any) started. Setting up RxTx..."
+              );
+              await this.connectRXTX();
+              this.addBleLog("RxTx setup done. Marking connected.");
+              this.bleConnected = true;
+              await this.triggerRxTxCmd("e100");
+              await this.queryDeviceTemp();
+              await new Promise((res) => setTimeout(res, 2000));
+              await this.renderToCanvas();
+              await this.uploadImage();
+              try {
+                localStorage.setItem("lastBleName", bleDevice.name || "");
+              } catch (e) {}
+            } catch (e) {
+              this.addBleLog("Connect sequence failed: " + e.message);
+              console.error(e);
+              throw e;
+            }
+          }
+        },
+        disconnect() {
+          resetVariables();
+          this.bleConnected = false;
+          this.addBleLog("Disconnected");
+        },
+        async reConnect() {
+          if (bleDevice && bleDevice.gatt.connected)
+            bleDevice.gatt.disconnect();
+          resetVariables();
+          setTimeout(async () => {
+            if (bleDevice) await this.connect();
+          }, 300);
+        },
+        async attemptAutoConnect() {
+          if (!("bluetooth" in navigator)) {
+            this.addBleLog("Web Bluetooth not supported");
+            return;
+          }
+          if (!navigator.bluetooth.getDevices) {
+            this.addBleLog(
+              "getDevices() unsupported (requires secure context + recent Chromium). Fallback to stored last device."
+            );
+            try {
+              const last = localStorage.getItem("lastBleName");
+              if (last) {
+                this.addBleLog(
+                  "Last connected device: " +
+                    last +
+                    ". Click Connect to pair again."
+                );
+              } else {
+                this.addBleLog("Use Connect button to select your THX device.");
+              }
+            } catch (e) {}
+            return;
+          }
+          try {
+            autoConnectAttempts++;
+            this.addBleLog("Auto-connect attempt #" + autoConnectAttempts);
+            const devices = await navigator.bluetooth.getDevices();
+            this.addBleLog("Granted devices: " + devices.length);
+            devices.forEach((d) =>
+              this.addBleLog(" - " + (d.name || "Unnamed"))
+            );
+            const candidate = devices.find(
+              (d) => d.name && d.name.startsWith("THX")
+            );
+            if (candidate) {
+              this.addBleLog(
+                "Found THX device: " + candidate.name + " connecting..."
+              );
+              bleDevice = candidate;
+              bleDevice.addEventListener("gattserverdisconnected", () =>
+                this.disconnect()
+              );
+              await this.connect();
+            } else if (autoConnectAttempts < 3 && !this.bleConnected) {
+              setTimeout(() => this.attemptAutoConnect(), 1500);
+            } else {
+              this.addBleLog("No THX* device among granted devices");
+            }
+          } catch (e) {
+            this.addBleLog("Auto-connect failed: " + e.message);
+          }
+        },
+        async handleError(error) {
+          this.addBleLog("Error: " + (error?.message || error));
+          resetVariables();
+          if (!bleDevice) return;
+          if (reconnectTrys <= 5) {
+            reconnectTrys++;
+            await this.connect();
+          } else reconnectTrys = 0;
+        },
+        handleRxtxNotification(event) {
+          try {
+            const dv = event.target.value;
+            const len = dv.byteLength;
+            const arr = new Uint8Array(dv.buffer.slice(0, len));
+            const hex = Array.from(arr)
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join("");
+
+            this.addBleLog("Rx RxTx len=" + len + " hex=" + hex);
+
+            const t = parseTemperatureFromBytes(arr);
+            if (t != null && t > -60 && t < 120) {
+              this.deviceTemp = t;
+            }
+          } catch (e) {
+            console.error("handleRxtxNotification error", e);
+          }
+        },
+        async renderToCanvas() {
+          const captureNode = document.getElementById("capture");
+          // Wait for reactive DOM update (time change) to flush before capture
+          await new Promise((r) =>
+            requestAnimationFrame(() => requestAnimationFrame(r))
+          );
+
+          const canvas = await html2canvas(captureNode, {
+            backgroundColor: "#fff",
+            scale: 1,
+            width: 250,
+            height: 128,
+          });
+
+          const out = document.getElementById("outCanvas");
+          const ctx = out.getContext("2d");
+          ctx.clearRect(0, 0, out.width, out.height);
+          ctx.drawImage(canvas, 0, 0);
+          // Apply fixed bwr_Atkinson palette dithering for device compatibility
+          try {
+            ditheringCanvasByPalette(out, bwrPalette, "Atkinson", {
+              dithSerp: false,
+            });
+          } catch (e) {
+            console.warn("Dither failed", e);
+          }
+        },
+        async mounted() {
+          // Initial immediate weather fetch & first render
+          try {
+            await this.fetchWeather();
+          } catch (e) {
+            console.warn(e);
+          }
+          try {
+            await this.renderToCanvas();
+          } catch (e) {
+            console.warn(e);
+          }
+          // Ensure persisted if loaded default
+          this.saveLocation();
+
+          // Attempt auto-connect to previously paired THX* device
+          this.attemptAutoConnect();
+
+          this._tickRunning = false;
+          const self = this;
+
+          async function minuteTick() {
+            if (self._tickRunning) {
+              return;
+            }
+            self._tickRunning = true;
+            // Schedule next tick immediately to avoid drift from processing time
+            scheduleNext();
+            try {
+              self.now = new Date();
+              const now = self.now;
+
+              // Always render first so UI updates before device upload
+              await self.renderToCanvas();
+              if (self.bleConnected) {
+                await self.uploadImage();
+                // query device temp after upload
+                try {
+                  await self.queryDeviceTemp();
+                } catch (e) {}
+              }
+
+              if (now.getMinutes() % 5 === 0) {
+                await self.fetchWeather();
+                // Re-render after new data
+                await self.renderToCanvas();
+                if (self.bleConnected) {
+                  await self.uploadImage();
+                  try {
+                    await self.queryDeviceTemp();
+                  } catch (e) {}
+                }
+              }
+            } catch (err) {
+              console.error("Minute tick error", err);
+            } finally {
+              self._tickRunning = false;
+            }
+          }
+          function scheduleNext() {
+            const msToNext = 60000 - (Date.now() % 60000);
+            self._minuteTimer = setTimeout(minuteTick, msToNext);
+          }
+          // Kick off first aligned tick
+          minuteTick();
+        },
+      };
+      PetiteVue.createApp(App).mount();
+      App.mounted();
+    </script>
+  </body>
+</html>
