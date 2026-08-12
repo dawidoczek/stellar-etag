@@ -39,7 +39,7 @@ _attribute_ram_code_ void init_time(void)
 
 _attribute_ram_code_ void handler_time(void)
 {
-    if (clock_time() - last_clock_increase >= one_second_trimmed)
+    while (clock_time() - last_clock_increase >= one_second_trimmed)
     {
         last_clock_increase += one_second_trimmed;
         current_unix_time++;
