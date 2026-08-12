@@ -1070,26 +1070,20 @@
               self.now = new Date();
               const now = self.now;
 
-              // Always render first so UI updates before device upload
-              await self.renderToCanvas();
-              if (self.bleConnected) {
-                await self.uploadImage();
-                // query device temp after upload
-                try {
-                  await self.queryDeviceTemp();
-                } catch (e) {}
-              }
-
-              if (now.getMinutes() % 5 === 0) {
+              // Only update on the exact hour (minute 0)
+              if (now.getMinutes() === 0) {
                 await self.fetchWeather();
-                // Re-render after new data
                 await self.renderToCanvas();
+                
                 if (self.bleConnected) {
                   await self.uploadImage();
                   try {
                     await self.queryDeviceTemp();
                   } catch (e) {}
                 }
+              } else {
+                // Just update the local UI clock without triggering BLE upload
+                await self.renderToCanvas();
               }
             } catch (err) {
               console.error("Minute tick error", err);
