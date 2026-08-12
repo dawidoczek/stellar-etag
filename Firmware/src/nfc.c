@@ -10,6 +10,13 @@ uint8_t nfc_reset[] = {0x03, 0xb5, 0xa0};
 
 _attribute_ram_code_ void init_nfc(void)
 {
+    // Ensure the NFC chip is enabled / not in SPI mode
+    gpio_write(NFC_CS, 1);
+    gpio_set_func(NFC_CS, AS_GPIO);
+    gpio_set_output_en(NFC_CS, 1);
+    gpio_set_input_en(NFC_CS, 0);
+    gpio_setup_up_down_resistor(NFC_CS, PM_PIN_PULLUP_10K);
+
     // Configure IRQ pin to detect NFC taps
     gpio_set_func(NFC_IRQ, AS_GPIO);
     gpio_set_output_en(NFC_IRQ, 0);
