@@ -6,7 +6,7 @@
 #include "etime.h"
 #include "main.h"
 
-RAM int32_t time_trime = 7021; // The higher the number the slower the time runs!
+RAM int32_t time_trime = 4262; // The higher the number the slower the time runs!
 RAM uint32_t one_second_trimmed = CLOCK_16M_SYS_TIMER_CLK_1S;
 RAM uint32_t current_unix_time;
 RAM struct date_time current_date = {0};
